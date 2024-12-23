@@ -1,0 +1,161 @@
+name: revolt
+
+services:
+  # MongoDB database
+  database:
+    image: mongo
+    restart: always
+    volumes:
+      - ./data/db:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  # Redis server
+  redis:
+    image: eqalpha/keydb
+    restart: always
+
+  rabbit:
+    image: rabbitmq:4
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbituser
+      RABBITMQ_DEFAULT_PASS: rabbitpass
+    volumes:
+      - ./data/rabbit:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # S3-compatible storage server
+  minio:
+    image: minio/minio
+    command: server /data
+    volumes:
+      - ./data/minio:/data
+    environment:
+      MINIO_ROOT_USER: minioautumn
+      MINIO_ROOT_PASSWORD: minioautumn
+      MINIO_DOMAIN: minio
+    networks:
+      default:
+        aliases:
+          - revolt-uploads.minio
+          # legacy support:
+          - attachments.minio
+          - avatars.minio
+          - backgrounds.minio
+          - icons.minio
+          - banners.minio
+          - emojis.minio
+    restart: always
+
+  # Caddy web server
+  caddy:
+    image: caddy
+    restart: always
+    env_file: .env.web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./data/caddy-data:/data
+      - ./data/caddy-config:/config
+
+  # API server (delta)
+  api:
+    image: ghcr.io/revoltchat/server:20241213-1
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbit:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./Revolt.toml
+        target: /Revolt.toml
+    restart: always
+
+  # Events service (quark)
+  events:
+    image: ghcr.io/revoltchat/bonfire:20241213-1
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - type: bind
+        source: ./Revolt.toml
+        target: /Revolt.toml
+    restart: always
+
+  # Web App (revite)
+  web:
+    image: ghcr.io/revoltchat/client:master
+    restart: always
+    env_file: .env.web
+
+  # File server (autumn)
+  autumn:
+    image: ghcr.io/revoltchat/autumn:20241213-1
+    depends_on:
+      database:
+        condition: service_healthy
+      createbuckets:
+        condition: service_started
+    volumes:
+      - type: bind
+        source: ./Revolt.toml
+        target: /Revolt.toml
+    restart: always
+
+  # Metadata and image proxy (january)
+  january:
+    image: ghcr.io/revoltchat/january:20241213-1
+    volumes:
+      - type: bind
+        source: ./Revolt.toml
+        target: /Revolt.toml
+    restart: always
+
+  # Push notification daemon (pushd)
+  pushd:
+    image: ghcr.io/revoltchat/pushd:20241213-1
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbit:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./Revolt.toml
+        target: /Revolt.toml
+    restart: always
+
+  # Create buckets for minio.
+  createbuckets:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      while ! /usr/bin/mc ready minio; do
+        /usr/bin/mc config host add minio http://minio:9000 minioautumn minioautumn;
+        echo 'Waiting minio...' && sleep 1;
+      done;
+      /usr/bin/mc mb minio/revolt-uploads;
+      exit 0;
+      "
